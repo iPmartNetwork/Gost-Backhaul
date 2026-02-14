@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-### ================= PATHS =================
+#################### PATHS ####################
 BIN="/usr/bin"
 CONF="/etc/gost"
 SYS="/lib/systemd/system"
@@ -12,22 +12,19 @@ STATE="/var/lib/gost-switchd"
 
 [[ $EUID -ne 0 ]] && echo "[ERROR] Run as root" && exit 1
 
-### ================= DEPENDENCIES =================
+################ DEPENDENCIES #################
 install_deps() {
   if command -v jq >/dev/null 2>&1; then return; fi
   if command -v apt >/dev/null 2>&1; then
     apt update -y
     apt install -y curl jq tar python3 iproute2 netcat-openbsd openssl
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl jq tar python3 iproute nc openssl
   else
-    echo "[ERROR] Unsupported OS"
-    exit 1
+    yum install -y curl jq tar python3 iproute nc openssl
   fi
 }
 install_deps
 
-### ================= ARCH =================
+################ ARCH #########################
 case "$(uname -m)" in
   x86_64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
@@ -35,7 +32,7 @@ case "$(uname -m)" in
   *) echo "[ERROR] Unsupported arch"; exit 1 ;;
 esac
 
-### ================= INSTALL GOST =================
+################ INSTALL GOST #################
 install_gost() {
   echo "[INFO] Installing gost..."
   URL=$(curl -fsSL https://api.github.com/repos/go-gost/gost/releases/latest \
@@ -47,18 +44,18 @@ install_gost() {
   gost -V
 }
 
-### ================= INSTALL BACKHAUL =================
+################ INSTALL BACKHAUL #############
 install_backhaul() {
   echo "[INFO] Installing Backhaul..."
   URL=$(curl -fsSL https://api.github.com/repos/Musixal/Backhaul/releases/latest \
     | jq -r --arg a "linux_${ARCH}.tar.gz" '.assets[] | select(.name | endswith($a)) | .browser_download_url' | head -n1)
   [[ -z "$URL" ]] && { echo "[ERROR] Backhaul binary not found"; return; }
-  curl -fL "$URL" -o /tmp/bh.tgz
-  tar -xzf /tmp/bh.tgz -C /tmp
+  curl -fL "$URL" -o /tmp/backhaul.tgz
+  tar -xzf /tmp/backhaul.tgz -C /tmp
   install -m755 /tmp/backhaul $BIN/backhaul
 }
 
-### ================= CONFIGURE BACKHAUL (FIXED) =================
+############### CONFIGURE BACKHAUL (FIXED) ###############
 configure_backhaul() {
   mkdir -p /etc/backhaul /etc/gost
 
@@ -75,6 +72,8 @@ configure_backhaul() {
     LP=${LP:-4000}
 
 cat >"$BHCONF" <<EOF
+type = "client"
+
 [client]
 remote = "$F:$RP"
 local  = "127.0.0.1:$LP"
@@ -86,6 +85,8 @@ EOF
     SP=${SP:-9000}
 
 cat >"$BHCONF" <<EOF
+type = "server"
+
 [server]
 listen = "0.0.0.0:$SP"
 EOF
@@ -111,7 +112,7 @@ EOF
   systemctl restart backhaul
 }
 
-### ================= ADD GOST TUNNEL =================
+################ ADD GOST TUNNEL ################
 add_tunnel() {
   ROLE=$(cat "$ROLE_FILE" 2>/dev/null || echo "IRAN")
   mkdir -p "$CONF" "$STATE"
@@ -129,14 +130,14 @@ add_tunnel() {
     1) ORDER='["reality","wss","ws","tcp"]' ;;
     2) ORDER='["tcp","ws"]' ;;
     3) ORDER='["reality","quic","wss"]' ;;
-    *) echo "Invalid profile"; return ;;
+    *) echo "[ERROR] Invalid profile"; return ;;
   esac
 
   for P in "${LIST[@]}"; do
     P=$(echo "$P" | xargs)
 
     if [[ "$ROLE" == "IRAN" ]]; then
-      ss -lnt | grep -q ":$P " && { echo "[ERROR] Port $P busy on IRAN"; continue; }
+      ss -lnt | grep -q ":$P " && { echo "[ERROR] Port $P busy"; continue; }
     fi
 
     read -p "Protocol for port $P (tcp/ws/wss/reality/quic): " PROTO
@@ -175,24 +176,23 @@ EOF
     systemctl daemon-reload
     systemctl enable gost@$P
     systemctl start gost@$P
-    echo "[OK] gost@$P created ($PROTO)"
+    echo "[OK] gost@$P created"
   done
 }
 
-### ================= DPI / AUTO-SWITCH DAEMON =================
+################ DPI DAEMON ################
 install_daemon() {
   mkdir -p "$SWD" "$STATE"
 
 cat >"$SWD/gost-switchd.py" <<'EOF'
 #!/usr/bin/env python3
 import os,json,time,subprocess
-
 STATE="/var/lib/gost-switchd"
 CONF="/etc/gost"
 
-def bad(port):
-    o=subprocess.getoutput(f"timeout 3 nc -vz 127.0.0.1 {port}")
-    return ("reset" in o) or ("refused" in o)
+def bad(p):
+    o=subprocess.getoutput(f"timeout 3 nc -vz 127.0.0.1 {p}")
+    return "reset" in o or "refused" in o
 
 while True:
     for f in os.listdir(STATE):
@@ -202,7 +202,7 @@ while True:
         order=s["order"]; cur=s["current"]
         if bad(p):
             i=order.index(cur)
-            if i+1 < len(order):
+            if i+1<len(order):
                 nxt=order[i+1]
                 s["current"]=nxt
                 json.dump(s,open(f"{STATE}/{f}","w"))
@@ -230,33 +230,7 @@ systemctl enable gost-switchd
 systemctl start gost-switchd
 }
 
-### ================= UTIL =================
-list_tunnels() { ls $CONF/*.json 2>/dev/null | sed 's#.*/##;s#.json##'; }
-
-remove_tunnel() {
-  list_tunnels
-  read -p "Port to remove: " P
-  systemctl stop gost@$P 2>/dev/null || true
-  systemctl disable gost@$P 2>/dev/null || true
-  rm -f "$CONF/$P.json" "$SYS/gost@$P.service" "$STATE/$P.json"
-  systemctl daemon-reload
-}
-
-remove_all() {
-  for P in $(list_tunnels); do
-    systemctl stop gost@$P 2>/dev/null || true
-    systemctl disable gost@$P 2>/dev/null || true
-    rm -f "$CONF/$P.json" "$SYS/gost@$P.service" "$STATE/$P.json"
-  done
-  systemctl daemon-reload
-}
-
-status_all() {
-  systemctl status backhaul --no-pager
-  for P in $(list_tunnels); do systemctl status gost@$P --no-pager; done
-}
-
-### ================= MENU =================
+################ MENU ################
 while true; do
   clear
   echo "========= Gost + Backhaul Manager ========="
@@ -264,12 +238,7 @@ while true; do
   echo "2) Install / Update Backhaul"
   echo "3) Configure Backhaul (IRAN / FOREIGN)"
   echo "4) Add gost tunnel"
-  echo "5) Remove gost tunnel"
-  echo "6) List tunnels"
-  echo "7) Service status"
-  echo "8) Restart services"
-  echo "9) Remove ALL tunnels"
-  echo "10) Install / Start DPI daemon"
+  echo "5) Install / Start DPI daemon"
   echo "0) Exit"
   read -p "Select: " C
   case "$C" in
@@ -277,12 +246,7 @@ while true; do
     2) install_backhaul ;;
     3) configure_backhaul ;;
     4) add_tunnel ;;
-    5) remove_tunnel ;;
-    6) list_tunnels ;;
-    7) status_all ;;
-    8) systemctl restart backhaul; for p in $(list_tunnels); do systemctl restart gost@$p; done ;;
-    9) remove_all ;;
-    10) install_daemon ;;
+    5) install_daemon ;;
     0) exit ;;
   esac
   read -p "Press Enter..."
