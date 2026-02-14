@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 
 echo "=================================================="
-echo " Gost + Backhaul Ultimate Installer"
-echo " (with DPI / QUIC / Rollback daemon)"
+echo " Gost + Backhaul Ultimate Installer "
 echo "=================================================="
 
 ############################
@@ -12,11 +11,10 @@ if [[ $EUID -ne 0 ]]; then
   echo "[ERROR] Please run as root"
   exit 1
 fi
-
 set -e
 
 ############################
-# PATHS (CANONICAL)
+# PATHS
 ############################
 BIN_DIR="/usr/bin"
 CONF_DIR="/etc/gost"
@@ -25,17 +23,14 @@ STATE_DIR="/var/lib/gost-switchd"
 SYSTEMD_DIR="/lib/systemd/system"
 
 ############################
-# ARCH DETECTION
+# ARCH
 ############################
 detect_arch() {
   case "$(uname -m)" in
     x86_64) ARCH="amd64" ;;
     aarch64|arm64) ARCH="arm64" ;;
     armv7l) ARCH="armv7" ;;
-    *)
-      echo "[ERROR] Unsupported architecture"
-      exit 1
-      ;;
+    *) echo "[ERROR] Unsupported architecture"; exit 1 ;;
   esac
 }
 
@@ -62,7 +57,6 @@ install_deps() {
     echo "[ERROR] Unsupported OS"
     exit 1
   fi
-
   pip3 install --no-cache-dir requests
 }
 
@@ -75,7 +69,7 @@ install_gost() {
 
   API="https://api.github.com/repos/go-gost/gost/releases/latest"
   URL=$(curl -fsSL "$API" \
-    | jq -r ".assets[] | select(.name | test(\"linux.*${ARCH}\")) | .browser_download_url" \
+    | jq -r ".assets[] | select(.name | contains(\"linux\") and contains(\"$ARCH\")) | .browser_download_url" \
     | head -n1)
 
   [[ -z "$URL" ]] && { echo "[ERROR] gost binary not found"; exit 1; }
@@ -96,11 +90,15 @@ install_backhaul() {
   detect_arch
 
   API="https://api.github.com/repos/Musixal/Backhaul/releases/latest"
-  URL=$(curl -fsSL "$API" \
-    | jq -r ".assets[] | select(.name | test(\"linux_${ARCH}\\.tar\\.gz\")) | .browser_download_url" \
+  URL=$(curl -fsSL "$API" | jq -r \
+    --arg arch "linux_${ARCH}.tar.gz" \
+    '.assets[] | select(.name | endswith($arch)) | .browser_download_url' \
     | head -n1)
 
-  [[ -z "$URL" ]] && { echo "[ERROR] Backhaul archive not found"; exit 1; }
+  if [[ -z "$URL" ]]; then
+    echo "[ERROR] Backhaul archive not found for architecture: $ARCH"
+    exit 1
+  fi
 
   TMP="/tmp/backhaul"
   rm -rf "$TMP"
@@ -147,7 +145,7 @@ EOF
 }
 
 ############################
-# GOST INSTANCE (MULTI)
+# GOST INSTANCE
 ############################
 create_gost_instance() {
   PORT="$1"
@@ -160,10 +158,7 @@ create_gost_instance() {
     cdn) LISTENER="tcp" ;;
     reality|ultimate) LISTENER="reality" ;;
     h3) LISTENER="quic" ;;
-    *)
-      echo "[ERROR] Invalid profile"
-      exit 1
-      ;;
+    *) echo "[ERROR] Invalid profile"; exit 1 ;;
   esac
 
 cat >"$CONF_DIR/$PORT.json" <<EOF
@@ -203,22 +198,17 @@ EOF
 }
 
 ############################
-# INSTALL SWITCH DAEMON
+# INSTALL SWITCH DAEMON FILES
 ############################
 install_switchd_files() {
-  echo "[INFO] Installing DPI/QUIC switch daemon..."
-
+  echo "[INFO] Installing DPI / QUIC switch daemon..."
   mkdir -p "$SWITCHD_DIR" "$STATE_DIR" "$CONF_DIR"
 
-  # daemon
   cp switchd/gost-switchd.py "$SWITCHD_DIR/gost-switchd.py"
-  chmod +x "$SWITCHD_DIR/gost-switchd.py"
-
-  # profiles
   cp profiles/profiles.json "$CONF_DIR/profiles.json"
-
-  # systemd
   cp systemd/gost-switchd.service "$SYSTEMD_DIR/gost-switchd.service"
+
+  chmod +x "$SWITCHD_DIR/gost-switchd.py"
 }
 
 ############################
