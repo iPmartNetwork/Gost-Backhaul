@@ -1,251 +1,163 @@
 #!/usr/bin/env bash
-
-echo "=================================================="
-echo " Gost + Backhaul Ultimate Installer "
-echo "=================================================="
-
-############################
-# SANITY
-############################
-if [[ $EUID -ne 0 ]]; then
-  echo "[ERROR] Please run as root"
-  exit 1
-fi
 set -e
 
-############################
-# PATHS
-############################
-BIN_DIR="/usr/bin"
-CONF_DIR="/etc/gost"
-SWITCHD_DIR="/opt/gost-switchd"
-STATE_DIR="/var/lib/gost-switchd"
-SYSTEMD_DIR="/lib/systemd/system"
+echo "=== Gost + Backhaul Ultimate Installer ==="
 
-############################
-# ARCH
-############################
-detect_arch() {
-  case "$(uname -m)" in
-    x86_64) ARCH="amd64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
-    armv7l) ARCH="armv7" ;;
-    *) echo "[ERROR] Unsupported architecture"; exit 1 ;;
-  esac
-}
+# ---------- SANITY ----------
+[[ $EUID -ne 0 ]] && echo "Run as root" && exit 1
 
-############################
-# PORT CHECK
-############################
-is_port_free() {
-  ! ss -lnt | awk '{print $4}' | grep -q ":$1$"
-}
+# ---------- PATHS ----------
+BIN=/usr/bin
+CONF=/etc/gost
+SWD=/opt/gost-switchd
+STATE=/var/lib/gost-switchd
+SYS=/lib/systemd/system
+BHCONF=/etc/backhaul/config.toml
 
-############################
-# DEPENDENCIES
-############################
-install_deps() {
-  echo "[INFO] Installing dependencies..."
-  if command -v apt >/dev/null; then
-    apt update -y
-    apt install -y curl jq tar ca-certificates iproute2 \
-                   python3 python3-pip openssl netcat-openbsd
-  elif command -v yum >/dev/null; then
-    yum install -y curl jq tar ca-certificates iproute \
-                   python3 python3-pip openssl nc
-  else
-    echo "[ERROR] Unsupported OS"
-    exit 1
-  fi
-  pip3 install --no-cache-dir requests
-}
+# ---------- ARCH ----------
+case "$(uname -m)" in
+  x86_64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  armv7l) ARCH=armv7 ;;
+  *) echo "Unsupported arch"; exit 1 ;;
+esac
 
-############################
-# INSTALL GOST
-############################
-install_gost() {
-  echo "[INFO] Installing gost..."
-  detect_arch
+# ---------- DEPS ----------
+if command -v apt >/dev/null; then
+  apt update -y
+  apt install -y curl jq tar python3 python3-pip iproute2 openssl netcat-openbsd
+elif command -v yum >/dev/null; then
+  yum install -y curl jq tar python3 python3-pip iproute openssl nc
+fi
+pip3 install --no-cache-dir requests
 
-  API="https://api.github.com/repos/go-gost/gost/releases/latest"
-  URL=$(curl -fsSL "$API" \
-    | jq -r ".assets[] | select(.name | contains(\"linux\") and contains(\"$ARCH\")) | .browser_download_url" \
-    | head -n1)
+# ---------- INSTALL GOST ----------
+echo "[+] Installing gost"
+GOST_URL=$(curl -fsSL https://api.github.com/repos/go-gost/gost/releases/latest \
+ | jq -r ".assets[] | select(.name|contains(\"linux\") and contains(\"$ARCH\")) | .browser_download_url" | head -n1)
+curl -fL "$GOST_URL" -o /tmp/gost.tar.gz
+tar -xzf /tmp/gost.tar.gz -C /tmp
+install -m755 /tmp/gost $BIN/gost
 
-  [[ -z "$URL" ]] && { echo "[ERROR] gost binary not found"; exit 1; }
+# ---------- INSTALL BACKHAUL ----------
+echo "[+] Installing Backhaul"
+BH_URL=$(curl -fsSL https://api.github.com/repos/Musixal/Backhaul/releases/latest \
+ | jq -r --arg a "linux_${ARCH}.tar.gz" '.assets[]|select(.name|endswith($a))|.browser_download_url' | head -n1)
+mkdir -p /tmp/bh && curl -fL "$BH_URL" -o /tmp/bh.tgz
+tar -xzf /tmp/bh.tgz -C /tmp/bh
+install -m755 /tmp/bh/backhaul $BIN/backhaul
 
-  curl -fL "$URL" -o /tmp/gost.tar.gz
-  tar -xzf /tmp/gost.tar.gz -C /tmp
-  install -m 755 /tmp/gost "$BIN_DIR/gost"
+# ---------- BACKHAUL CONFIG ----------
+read -p "Foreign server IP/domain: " FOREIGN
+read -p "Backhaul remote port [9000]: " RPORT
+read -p "Backhaul local port [4000]: " LPORT
+RPORT=${RPORT:-9000}; LPORT=${LPORT:-4000}
 
-  echo "[OK] gost installed:"
-  gost -V
-}
+mkdir -p /etc/backhaul
+cat >$BHCONF <<EOF
+[client]
+remote_addr = "$FOREIGN:$RPORT"
+local_addr  = "127.0.0.1:$LPORT"
+EOF
 
-############################
-# INSTALL BACKHAUL (FIXED)
-############################
-install_backhaul() {
-  echo "[INFO] Installing Backhaul..."
-  detect_arch
-
-  API="https://api.github.com/repos/Musixal/Backhaul/releases/latest"
-  URL=$(curl -fsSL "$API" | jq -r \
-    --arg arch "linux_${ARCH}.tar.gz" \
-    '.assets[] | select(.name | endswith($arch)) | .browser_download_url' \
-    | head -n1)
-
-  if [[ -z "$URL" ]]; then
-    echo "[ERROR] Backhaul archive not found for architecture: $ARCH"
-    exit 1
-  fi
-
-  TMP="/tmp/backhaul"
-  rm -rf "$TMP"
-  mkdir -p "$TMP"
-
-  curl -fL "$URL" -o "$TMP/backhaul.tar.gz"
-  tar -xzf "$TMP/backhaul.tar.gz" -C "$TMP"
-
-  BIN=$(find "$TMP" -type f -name backhaul | head -n1)
-  [[ -z "$BIN" ]] && { echo "[ERROR] Backhaul binary not found in archive"; exit 1; }
-
-  install -m 755 "$BIN" "$BIN_DIR/backhaul"
-
-  echo "[OK] Backhaul installed:"
-  backhaul version || true
-}
-
-############################
-# BACKHAUL SERVICE
-############################
-setup_backhaul_service() {
-  read -p "Foreign server IP/domain: " FOREIGN_IP
-  read -p "Backhaul remote port [9000]: " BACKHAUL_REMOTE_PORT
-  read -p "Backhaul local port [4000]: " BACKHAUL_LOCAL_PORT
-
-  BACKHAUL_REMOTE_PORT=${BACKHAUL_REMOTE_PORT:-9000}
-  BACKHAUL_LOCAL_PORT=${BACKHAUL_LOCAL_PORT:-4000}
-
-cat >"$SYSTEMD_DIR/backhaul.service" <<EOF
+cat >$SYS/backhaul.service <<EOF
 [Unit]
-Description=Backhaul Client
 After=network.target
-
 [Service]
-ExecStart=$BIN_DIR/backhaul client \
-  --remote ${FOREIGN_IP}:${BACKHAUL_REMOTE_PORT} \
-  --local 127.0.0.1:${BACKHAUL_LOCAL_PORT}
+ExecStart=$BIN/backhaul -c $BHCONF
 Restart=always
-RestartSec=3
-
 [Install]
 WantedBy=multi-user.target
 EOF
-}
 
-############################
-# GOST INSTANCE
-############################
-create_gost_instance() {
-  PORT="$1"
-  PROFILE="$2"
+# ---------- GOST MULTI-PORT ----------
+mkdir -p $CONF
+read -p "Enter gost listen ports (comma separated): " PORTS
+IFS=',' read -ra PORT_LIST <<< "$PORTS"
 
-  case "$PROFILE" in
-    basic) LISTENER="tcp" ;;
-    ws) LISTENER="ws" ;;
-    wss) LISTENER="wss" ;;
-    cdn) LISTENER="tcp" ;;
-    reality|ultimate) LISTENER="reality" ;;
-    h3) LISTENER="quic" ;;
-    *) echo "[ERROR] Invalid profile"; exit 1 ;;
-  esac
+for P in "${PORT_LIST[@]}"; do
+  P=$(echo $P | xargs)
+  ss -lnt | grep -q ":$P " && echo "Port $P busy" && exit 1
 
-cat >"$CONF_DIR/$PORT.json" <<EOF
+cat >$CONF/$P.json <<EOF
 {
-  "profile": "$PROFILE",
-  "Services": [
-    {
-      "Name": "$PROFILE-$PORT",
-      "Addr": ":$PORT",
-      "Listener": {
-        "Type": "$LISTENER",
-        "TLS": { "ServerName": "www.cloudflare.com" }
-      },
-      "Handler": { "Type": "tcp" },
-      "Forwarder": {
-        "Nodes": [{ "Addr": "127.0.0.1:${BACKHAUL_LOCAL_PORT}" }]
-      }
-    }
-  ]
+  "Services":[{
+    "Name":"gost-$P",
+    "Addr":":$P",
+    "Listener":{"Type":"tcp"},
+    "Handler":{"Type":"tcp"},
+    "Forwarder":{"Nodes":[{"Addr":"127.0.0.1:$LPORT"}]}
+  }]
 }
 EOF
 
-cat >"$SYSTEMD_DIR/gost@$PORT.service" <<EOF
+cat >$SYS/gost@$P.service <<EOF
 [Unit]
-Description=Gost Instance on port $PORT
 After=network.target backhaul.service
 Requires=backhaul.service
-
 [Service]
-ExecStart=$BIN_DIR/gost -C $CONF_DIR/$PORT.json
+ExecStart=$BIN/gost -C $CONF/$P.json
 Restart=always
-RestartSec=3
-
 [Install]
 WantedBy=multi-user.target
 EOF
-}
 
-############################
-# INSTALL SWITCH DAEMON FILES
-############################
-install_switchd_files() {
-  echo "[INFO] Installing DPI / QUIC switch daemon..."
-  mkdir -p "$SWITCHD_DIR" "$STATE_DIR" "$CONF_DIR"
-
-  cp switchd/gost-switchd.py "$SWITCHD_DIR/gost-switchd.py"
-  cp profiles/profiles.json "$CONF_DIR/profiles.json"
-  cp systemd/gost-switchd.service "$SYSTEMD_DIR/gost-switchd.service"
-
-  chmod +x "$SWITCHD_DIR/gost-switchd.py"
-}
-
-############################
-# MAIN
-############################
-install_deps
-install_gost
-install_backhaul
-
-mkdir -p "$CONF_DIR"
-setup_backhaul_service
-
-read -p "How many gost instances do you want? " COUNT
-
-for ((i=1;i<=COUNT;i++)); do
-  echo "---- Instance $i ----"
-  while true; do
-    read -p "Listen port: " PORT
-    is_port_free "$PORT" && break
-    echo "Port is busy, choose another."
-  done
-  read -p "Profile (basic/ws/wss/cdn/reality/ultimate/h3): " PROFILE
-  create_gost_instance "$PORT" "$PROFILE"
-  systemctl enable gost@"$PORT"
+systemctl enable gost@$P
 done
 
-install_switchd_files
+# ---------- DPI / QUIC DAEMON ----------
+mkdir -p $SWD $STATE
 
+cat >$SWD/gost-switchd.py <<'EOF'
+#!/usr/bin/env python3
+import os, json, time, subprocess
+
+STATE="/var/lib/gost-switchd"
+PORTS=[f.replace(".json","") for f in os.listdir("/etc/gost") if f.endswith(".json")]
+
+PROFILES=["basic","ws","wss","reality","h3"]
+
+def tcp_rst(p):
+    out=subprocess.getoutput(f"timeout 3 nc -vz 127.0.0.1 {p}")
+    return "refused" in out or "reset" in out
+
+def tls_fail():
+    o=subprocess.getoutput("timeout 5 openssl s_client -connect google.com:443")
+    return "handshake" in o.lower()
+
+while True:
+    for p in PORTS:
+        st=os.path.join(STATE,f"{p}.json")
+        cur=json.load(open(st))["profile"] if os.path.exists(st) else PROFILES[0]
+
+        if tcp_rst(p):
+            nxt="reality"
+        elif tls_fail():
+            nxt="wss"
+        else:
+            nxt="basic"
+
+        if nxt!=cur:
+            json.dump({"profile":nxt,"ts":time.time()},open(st,"w"))
+            subprocess.call(["systemctl","restart",f"gost@{p}"])
+    time.sleep(30)
+EOF
+chmod +x $SWD/gost-switchd.py
+
+cat >$SYS/gost-switchd.service <<EOF
+[Unit]
+After=network.target
+[Service]
+ExecStart=/usr/bin/python3 $SWD/gost-switchd.py
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ---------- ENABLE ----------
 systemctl daemon-reload
 systemctl enable backhaul gost-switchd
 systemctl restart backhaul gost-switchd
+systemctl start gost@*
 
-for f in "$CONF_DIR"/*.json; do
-  systemctl restart gost@"$(basename "$f" .json)"
-done
-
-echo "=================================================="
-echo " Installation completed successfully"
-echo " DPI / QUIC / Rollback daemon is ACTIVE"
-echo "=================================================="
+echo "=== INSTALL COMPLETE ==="
