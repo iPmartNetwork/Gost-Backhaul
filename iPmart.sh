@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 echo "=============================================="
-echo " Gost + Backhaul Ultimate Installer (FINAL)"
+echo " Gost + Backhaul Ultimate Installer "
 echo "=============================================="
 
 ################ SANITY ################
@@ -17,8 +17,9 @@ CONF_DIR="/etc/gost"
 BIN_DIR="/usr/bin"
 SERVICE_DIR="/lib/systemd/system"
 SWITCHD_DIR="/opt/gost-switchd"
+STATE_DIR="/var/lib/gost-switchd"
 
-################ UTILS ################
+################ ARCH ################
 detect_arch() {
   case "$(uname -m)" in
     x86_64) ARCH="amd64" ;;
@@ -28,6 +29,7 @@ detect_arch() {
   esac
 }
 
+################ PORT CHECK ################
 is_port_free() {
   ! ss -lnt | awk '{print $4}' | grep -q ":$1$"
 }
@@ -41,7 +43,7 @@ install_deps() {
   elif command -v yum >/dev/null; then
     yum install -y curl jq tar ca-certificates iproute python3 python3-pip
   else
-    echo "[ERROR] Unsupported OSOS"
+    echo "[ERROR] Unsupported OS"
     exit 1
   fi
 
@@ -62,6 +64,7 @@ install_gost() {
   tar -xzf /tmp/gost.tar.gz -C /tmp
   install -m 755 /tmp/gost $BIN_DIR/gost
 
+  echo "[OK] gost installed:"
   gost -V
 }
 
@@ -71,13 +74,23 @@ install_backhaul() {
   detect_arch
 
   API="https://api.github.com/repos/Musixal/Backhaul/releases/latest"
-  URL=$(curl -fsSL "$API" | jq -r ".assets[] | select(.name | test(\"linux.*${ARCH}\")) | .browser_download_url" | head -n1)
+  URL=$(curl -fsSL "$API" | jq -r ".assets[] | select(.name | test(\"linux_${ARCH}\\.tar\\.gz\")) | .browser_download_url" | head -n1)
 
-  [[ -z "$URL" ]] && { echo "[ERROR] Backhaul binary not found"; exit 1; }
+  [[ -z "$URL" ]] && { echo "[ERROR] Backhaul asset not found"; exit 1; }
 
-  curl -fL "$URL" -o $BIN_DIR/backhaul
-  chmod +x $BIN_DIR/backhaul
+  TMP_DIR="/tmp/backhaul"
+  rm -rf "$TMP_DIR"
+  mkdir -p "$TMP_DIR"
 
+  curl -fL "$URL" -o "$TMP_DIR/backhaul.tar.gz"
+  tar -xzf "$TMP_DIR/backhaul.tar.gz" -C "$TMP_DIR"
+
+  BIN_PATH=$(find "$TMP_DIR" -type f -name backhaul)
+  [[ -z "$BIN_PATH" ]] && { echo "[ERROR] Backhaul binary not found in archive"; exit 1; }
+
+  install -m 755 "$BIN_PATH" $BIN_DIR/backhaul
+
+  echo "[OK] Backhaul installed:"
   backhaul version || true
 }
 
@@ -99,6 +112,7 @@ ExecStart=$BIN_DIR/backhaul client \
   --remote ${FOREIGN_IP}:${BACKHAUL_REMOTE_PORT} \
   --local 127.0.0.1:${BACKHAUL_LOCAL_PORT}
 Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -147,6 +161,7 @@ Requires=backhaul.service
 [Service]
 ExecStart=$BIN_DIR/gost -C $CONF_DIR/$PORT.json
 Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -156,32 +171,40 @@ EOF
 ################ SWITCH DAEMON ################
 install_switchd() {
   echo "[INFO] Installing gost-switchd..."
-  mkdir -p "$SWITCHD_DIR"
+  mkdir -p "$SWITCHD_DIR" "$STATE_DIR"
 
 cat >"$SWITCHD_DIR/gost-switchd.py" <<'EOF'
 #!/usr/bin/env python3
 import os, time, json, subprocess, socket, requests
 
-CONF_DIR = "/etc/gost"
-STATE_DIR = "/var/lib/gost-switchd"
-INTERVAL = 30
-COOLDOWN = 60
-PROFILES = ["basic","ws","wss","cdn","reality","ultimate"]
+CONF_DIR="/etc/gost"
+STATE_DIR="/var/lib/gost-switchd"
+
+INTERVAL=30
+COOLDOWN=60
+
+LOSS_UP=20
+LOSS_DOWN=5
+
+FAIL_TH=2
+SUCCESS_TH=5
+
+PROFILES=["basic","ws","wss","cdn","reality","ultimate"]
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
 def geo():
     try:
-        return requests.get("https://ipinfo.io/country", timeout=3).text.strip()
+        return requests.get("https://ipinfo.io/country",timeout=3).text.strip()
     except:
         return "IR"
 
-GEO = geo()
-START = "reality" if GEO == "IR" else "ws"
-MAX = "ultimate" if GEO == "IR" else "wss"
+GEO=geo()
+START="reality" if GEO=="IR" else "ws"
+MAX="ultimate" if GEO=="IR" else "wss"
 
 def loss():
-    out = subprocess.getoutput("ping -c 5 -W 2 8.8.8.8")
+    out=subprocess.getoutput("ping -c 5 -W 2 8.8.8.8")
     for l in out.splitlines():
         if "packet loss" in l:
             return int(l.split("%")[0].split()[-1])
@@ -189,36 +212,56 @@ def loss():
 
 def tcp(port):
     try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=3)
+        s=socket.create_connection(("127.0.0.1",port),timeout=3)
         s.close()
         return True
     except:
         return False
 
 while True:
-    l = loss()
+    l=loss()
     for f in os.listdir(CONF_DIR):
         if not f.endswith(".json"): continue
-        port = f.replace(".json","")
-        sp = f"{STATE_DIR}/{port}.json"
-        now = time.time()
+        port=int(f.replace(".json",""))
+        sp=f"{STATE_DIR}/{port}.json"
+        now=time.time()
 
         if os.path.exists(sp):
-            st = json.load(open(sp))
+            st=json.load(open(sp))
         else:
-            st = {"profile":START,"last":0}
+            st={"profile":START,"fail":0,"success":0,"last":0}
 
-        if now - st["last"] < COOLDOWN:
+        if now-st["last"]<COOLDOWN:
             continue
 
-        if l > 20 or not tcp(int(port)):
-            cur = st["profile"]
-            idx = PROFILES.index(cur)
-            if PROFILES[idx] == MAX: continue
-            st["profile"] = PROFILES[idx+1]
-            st["last"] = now
-            json.dump(st, open(sp,"w"))
-            subprocess.call(["systemctl","restart",f"gost@{port}"])
+        ok=tcp(port)
+
+        if l>LOSS_UP or not ok:
+            st["fail"]+=1
+            st["success"]=0
+            if st["fail"]>=FAIL_TH:
+                i=PROFILES.index(st["profile"])
+                if PROFILES[i]!=MAX:
+                    st["profile"]=PROFILES[i+1]
+                    st["last"]=now
+                    st["fail"]=0
+                    subprocess.call(["systemctl","restart",f"gost@{port}"])
+        elif l<LOSS_DOWN and ok:
+            st["success"]+=1
+            st["fail"]=0
+            if st["success"]>=SUCCESS_TH:
+                i=PROFILES.index(st["profile"])
+                if PROFILES[i]!=START:
+                    st["profile"]=PROFILES[i-1]
+                    st["last"]=now
+                    st["success"]=0
+                    subprocess.call(["systemctl","restart",f"gost@{port}"])
+        else:
+            st["fail"]=0
+            st["success"]=0
+
+        json.dump(st,open(sp,"w"))
+
     time.sleep(INTERVAL)
 EOF
 
@@ -231,6 +274,7 @@ After=network.target
 [Service]
 ExecStart=/usr/bin/python3 $SWITCHD_DIR/gost-switchd.py
 Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -252,7 +296,7 @@ for ((i=1;i<=COUNT;i++)); do
   while true; do
     read -p "Listen port: " PORT
     is_port_free "$PORT" && break
-    echo "Port busy"
+    echo "Port busy, choose another"
   done
   read -p "Profile (basic/ws/wss/cdn/reality/ultimate): " PROFILE
   create_instance "$PORT" "$PROFILE"
@@ -271,5 +315,5 @@ done
 
 echo "=============================================="
 echo " Installation completed successfully"
-echo " Auto-Switch + Geo-Preset ACTIVE"
+echo " Auto-Switch + Geo-Preset + Rollback ACTIVE"
 echo "=============================================="
