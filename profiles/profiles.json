@@ -1,0 +1,23 @@
+{
+  "order": ["basic", "ws", "wss", "cdn", "reality", "ultimate", "h3"],
+
+  "geo": {
+    "IR": {
+      "start": "reality",
+      "max": "ultimate",
+      "allow_h3": true
+    },
+    "FOREIGN": {
+      "start": "ws",
+      "max": "wss",
+      "allow_h3": true
+    }
+  },
+
+  "dpi_rules": {
+    "tcp_rst": "reality",
+    "tls_block": "wss",
+    "tcp_loss": "cdn",
+    "tcp_fail_udp_ok": "h3"
+  }
+}
