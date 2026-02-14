@@ -1,0 +1,86 @@
+Gost + Backhaul Ultimate Architecture
+====================================
+
+Client Devices
+--------------
+- Mobile
+- Desktop
+- Laptop
+- Router (optional)
+
+Clients connect using:
+- TLS
+- WSS
+- Reality / FakeTLS
+- CDN camouflage
+
+
+                Internet (Filtered / DPI)
+                         │
+                         │  TLS / WSS / Reality
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│                       IRAN SERVER                         │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │                Multi-Instance GOST                 │  │
+│  │                                                    │  │
+│  │  gost@443   → Reality / Ultimate                   │  │
+│  │  gost@8443  → WSS                                  │  │
+│  │  gost@2087  → CDN                                  │  │
+│  │  gost@PORT  → WS / TCP                             │  │
+│  │                                                    │  │
+│  │  - Anti-DPI Presets                                │  │
+│  │  - Geo-based Profile Selection                     │  │
+│  │  - Packet Loss Auto-Switch                         │  │
+│  │                                                    │  │
+│  └───────────────┬───────────────┬────────────────────┘  │
+│                   │               │                       │
+│                   └───────────────┴───────────────┐       │
+│                                                   ▼       │
+│              ┌───────────────────────────────────┐       │
+│              │        BACKHAUL CLIENT             │       │
+│              │                                   │       │
+│              │  - Encrypted Tunnel               │       │
+│              │  - Failover Ready                 │       │
+│              │  - Multi-Backhaul Support         │       │
+│              └───────────────┬───────────────────┘       │
+└──────────────────────────────┼───────────────────────────┘
+                               │
+                               │  Encrypted Backhaul Tunnel
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────┐
+│                     FOREIGN SERVER                       │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │                BACKHAUL SERVER                     │  │
+│  │                                                    │  │
+│  │  - Receives encrypted traffic                      │  │
+│  │  - No DPI                                          │  │
+│  │                                                    │  │
+│  └───────────────┬────────────────────────────────────┘  │
+│                   │                                       │
+│                   ▼                                       │
+│        ┌───────────────────────────────────┐             │
+│        │        Internet / Proxy / VPN      │             │
+│        │                                   │             │
+│        │  - Free Internet Access            │             │
+│        │  - Optional Proxy (SOCKS/HTTP)     │             │
+│        └───────────────────────────────────┘             │
+└──────────────────────────────────────────────────────────┘
+
+
+Legend
+------
+- gost@PORT.service : Independent Gost instance per port
+- Backhaul Client   : Tunnel from Iran → Foreign
+- Backhaul Server   : Tunnel endpoint on Foreign server
+
+Notes
+-----
+- The same install.sh is used on both Iran and Foreign servers.
+- Behavior depends on server role.
+- All ports are configurable.
+- Designed for high DPI environments.
+- Production-ready, systemd-native.
