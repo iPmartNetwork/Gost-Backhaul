@@ -3,34 +3,40 @@ import os, time, json, subprocess, socket, requests
 
 CONF_DIR = "/etc/gost"
 STATE_DIR = "/var/lib/gost-switchd"
+PROFILE_CFG = "/etc/gost/profiles.json"
+
 INTERVAL = 30
 COOLDOWN = 60
 
 LOSS_UP = 20
 LOSS_DOWN = 5
 
-FAIL_THRESHOLD = 2
-SUCCESS_THRESHOLD = 5
-
-PROFILES = ["basic", "ws", "wss", "cdn", "reality", "ultimate"]
+FAIL_TH = 2
+SUCCESS_TH = 5
 
 os.makedirs(STATE_DIR, exist_ok=True)
 
-# ---------------- GEO ----------------
+# ---------- load profiles ----------
+profiles = json.load(open(PROFILE_CFG))
+ORDER = profiles["order"]
+
+# ---------- GEO ----------
 def geo():
     try:
-        return requests.get("https://ipinfo.io/country", timeout=3).text.strip()
+        c = requests.get("https://ipinfo.io/country", timeout=3).text.strip()
+        return "IR" if c == "IR" else "FOREIGN"
     except:
         return "IR"
 
 GEO = geo()
+START = profiles["geo"][GEO]["start"]
+MAX = profiles["geo"][GEO]["max"]
+ALLOW_H3 = profiles["geo"][GEO]["allow_h3"]
 
-START_PROFILE = "reality" if GEO == "IR" else "ws"
-MAX_PROFILE   = "ultimate" if GEO == "IR" else "wss"
-
-# ---------------- CHECKS ----------------
-def packet_loss():
-    out = subprocess.getoutput("ping -c 5 -W 2 8.8.8.8")
+# ---------- checks ----------
+def packet_loss(proto="icmp"):
+    cmd = "ping -c 5 -W 2 8.8.8.8" if proto == "icmp" else "ping -c 5 -W 2 -U 8.8.8.8"
+    out = subprocess.getoutput(cmd)
     for l in out.splitlines():
         if "packet loss" in l:
             return int(l.split("%")[0].split()[-1])
@@ -44,77 +50,84 @@ def tcp_ok(port):
     except:
         return False
 
-# ---------------- STATE ----------------
+def tls_fail():
+    out = subprocess.getoutput("timeout 5 openssl s_client -connect google.com:443")
+    return "handshake failure" in out.lower()
+
+# ---------- state ----------
 def load_state(port):
-    path = f"{STATE_DIR}/{port}.json"
-    if not os.path.exists(path):
-        return {
-            "profile": START_PROFILE,
-            "fail": 0,
-            "success": 0,
-            "last": 0
-        }
-    return json.load(open(path))
+    p = f"{STATE_DIR}/{port}.json"
+    if not os.path.exists(p):
+        return {"profile": START, "fail": 0, "success": 0, "last": 0}
+    return json.load(open(p))
 
-def save_state(port, state):
-    json.dump(state, open(f"{STATE_DIR}/{port}.json", "w"))
+def save_state(port, st):
+    json.dump(st, open(f"{STATE_DIR}/{port}.json", "w"))
 
-# ---------------- SWITCH ----------------
-def switch_up(state):
-    idx = PROFILES.index(state["profile"])
-    if PROFILES[idx] == MAX_PROFILE:
-        return False
-    state["profile"] = PROFILES[idx + 1]
-    return True
-
-def switch_down(state):
-    idx = PROFILES.index(state["profile"])
-    if PROFILES[idx] == START_PROFILE:
-        return False
-    state["profile"] = PROFILES[idx - 1]
-    return True
-
-# ---------------- LOOP ----------------
+# ---------- main loop ----------
 while True:
-    loss = packet_loss()
+    tcp_loss = packet_loss("icmp")
+    udp_loss = packet_loss("udp")
+    tls_block = tls_fail()
 
     for f in os.listdir(CONF_DIR):
         if not f.endswith(".json"):
             continue
 
         port = int(f.replace(".json", ""))
-        state = load_state(port)
+        st = load_state(port)
         now = time.time()
 
-        if now - state["last"] < COOLDOWN:
+        if now - st["last"] < COOLDOWN:
             continue
 
-        ok = tcp_ok(port)
+        ok_tcp = tcp_ok(port)
+        cur = st["profile"]
 
-        # FAIL path
-        if loss > LOSS_UP or not ok:
-            state["fail"] += 1
-            state["success"] = 0
+        # --- DPI-aware decisions ---
+        target = None
 
-            if state["fail"] >= FAIL_THRESHOLD:
-                if switch_up(state):
-                    state["last"] = now
-                    state["fail"] = 0
+        if not ok_tcp and udp_loss < LOSS_DOWN and ALLOW_H3:
+            target = "h3"                # TCP DPI → QUIC
+        elif tls_block:
+            target = "wss"
+        elif tcp_loss > LOSS_UP:
+            target = "cdn"
+
+        # --- switch up ---
+        if target and target != cur:
+            st["profile"] = target
+            st["last"] = now
+            st["fail"] = 0
+            subprocess.call(["systemctl", "restart", f"gost@{port}"])
+
+        # --- classic fail ---
+        elif tcp_loss > LOSS_UP or not ok_tcp:
+            st["fail"] += 1
+            st["success"] = 0
+            if st["fail"] >= FAIL_TH:
+                idx = ORDER.index(cur)
+                if ORDER[idx] != MAX:
+                    st["profile"] = ORDER[idx + 1]
+                    st["last"] = now
+                    st["fail"] = 0
                     subprocess.call(["systemctl", "restart", f"gost@{port}"])
-        # SUCCESS path (Rollback)
-        elif loss < LOSS_DOWN and ok:
-            state["success"] += 1
-            state["fail"] = 0
 
-            if state["success"] >= SUCCESS_THRESHOLD:
-                if switch_down(state):
-                    state["last"] = now
-                    state["success"] = 0
+        # --- rollback ---
+        elif tcp_loss < LOSS_DOWN and ok_tcp:
+            st["success"] += 1
+            st["fail"] = 0
+            if st["success"] >= SUCCESS_TH:
+                idx = ORDER.index(cur)
+                if ORDER[idx] != START:
+                    st["profile"] = ORDER[idx - 1]
+                    st["last"] = now
+                    st["success"] = 0
                     subprocess.call(["systemctl", "restart", f"gost@{port}"])
         else:
-            state["fail"] = 0
-            state["success"] = 0
+            st["fail"] = 0
+            st["success"] = 0
 
-        save_state(port, state)
+        save_state(port, st)
 
     time.sleep(INTERVAL)
