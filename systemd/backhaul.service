@@ -1,0 +1,14 @@
+[Unit]
+Description=Backhaul Client Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/backhaul client \
+  --remote FOREIGN_IP:9000 \
+  --local 127.0.0.1:4000
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
