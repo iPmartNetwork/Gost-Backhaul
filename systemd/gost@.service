@@ -1,0 +1,13 @@
+[Unit]
+Description=Gost Instance on Port %i
+After=network.target backhaul.service
+Requires=backhaul.service
+
+[Service]
+ExecStart=/usr/bin/gost -C /etc/gost/%i.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
