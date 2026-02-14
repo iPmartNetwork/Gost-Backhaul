@@ -1,131 +1,55 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=================================================="
-echo " Gost + Backhaul Ultimate Installer (FINAL)"
-echo "=================================================="
+BIN=/usr/bin
+CONF=/etc/gost
+SYS=/lib/systemd/system
+BHCONF=/etc/backhaul/config.toml
+SWD=/opt/gost-switchd
 
-### SANITY
-[[ $EUID -ne 0 ]] && echo "[ERROR] Run as root" && exit 1
+[[ $EUID -ne 0 ]] && echo "Run as root" && exit 1
 
-### PATHS
-BIN="/usr/bin"
-CONF="/etc/gost"
-SWD="/opt/gost-switchd"
-STATE="/var/lib/gost-switchd"
-SYS="/lib/systemd/system"
-BHCONF="/etc/backhaul/config.toml"
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64) ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
+    armv7l) ARCH=armv7 ;;
+    *) echo "Unsupported arch"; exit 1 ;;
+  esac
+}
 
-### ARCH
-case "$(uname -m)" in
-  x86_64) ARCH="amd64" ;;
-  aarch64|arm64) ARCH="arm64" ;;
-  armv7l) ARCH="armv7" ;;
-  *) echo "[ERROR] Unsupported architecture"; exit 1 ;;
-esac
+install_deps() {
+  if command -v apt >/dev/null; then
+    apt update -y
+    apt install -y curl jq tar python3 python3-pip iproute2 openssl netcat-openbsd
+  else
+    yum install -y curl jq tar python3 python3-pip iproute openssl nc
+  fi
+}
 
-### DEPS
-if command -v apt >/dev/null; then
-  apt update -y
-  apt install -y curl jq tar python3 python3-pip iproute2 openssl netcat-openbsd
-elif command -v yum >/dev/null; then
-  yum install -y curl jq tar python3 python3-pip iproute openssl nc
-else
-  echo "[ERROR] Unsupported OS"
-  exit 1
-fi
-pip3 install --no-cache-dir requests
+install_gost() {
+  detect_arch
+  URL=$(curl -fsSL https://api.github.com/repos/go-gost/gost/releases/latest |
+    jq -r ".assets[]|select(.name|contains(\"linux\") and contains(\"$ARCH\"))|.browser_download_url"|head -n1)
+  curl -fL "$URL" -o /tmp/gost.tgz
+  tar -xzf /tmp/gost.tgz -C /tmp
+  install -m755 /tmp/gost $BIN/gost
+}
 
-### INSTALL GOST
-echo "[INFO] Installing gost..."
-GOST_URL=$(curl -fsSL https://api.github.com/repos/go-gost/gost/releases/latest \
- | jq -r ".assets[] | select(.name|contains(\"linux\") and contains(\"$ARCH\")) | .browser_download_url" | head -n1)
-curl -fL "$GOST_URL" -o /tmp/gost.tar.gz
-tar -xzf /tmp/gost.tar.gz -C /tmp
-install -m755 /tmp/gost $BIN/gost
-gost -V
+install_backhaul() {
+  detect_arch
+  URL=$(curl -fsSL https://api.github.com/repos/Musixal/Backhaul/releases/latest |
+    jq -r --arg a "linux_${ARCH}.tar.gz" '.assets[]|select(.name|endswith($a))|.browser_download_url'|head -n1)
+  curl -fL "$URL" -o /tmp/bh.tgz
+  tar -xzf /tmp/bh.tgz -C /tmp
+  install -m755 /tmp/backhaul $BIN/backhaul
+}
 
-### INSTALL BACKHAUL
-echo "[INFO] Installing Backhaul..."
-BH_URL=$(curl -fsSL https://api.github.com/repos/Musixal/Backhaul/releases/latest \
- | jq -r --arg a "linux_${ARCH}.tar.gz" '.assets[] | select(.name|endswith($a)) | .browser_download_url' | head -n1)
-mkdir -p /tmp/bh
-curl -fL "$BH_URL" -o /tmp/bh.tar.gz
-tar -xzf /tmp/bh.tar.gz -C /tmp/bh
-install -m755 /tmp/bh/backhaul $BIN/backhaul
+create_gost_port() {
+  read -p "Listen port: " P
+  ss -lnt | grep -q ":$P " && echo "Port busy" && return
 
-### ROLE SELECTION
-echo "--------------------------------------"
-echo "Select server role:"
-echo "  1) IRAN  (Backhaul client)"
-echo "  2) FOREIGN (Backhaul server)"
-read -p "Choice [1-2]: " ROLE
-
-mkdir -p /etc/backhaul
-
-if [[ "$ROLE" == "1" ]]; then
-  ### IRAN → CLIENT
-  read -p "Foreign server IP/domain: " FOREIGN
-  read -p "Backhaul remote port [9000]: " RPORT
-  read -p "Backhaul local port [4000]: " LPORT
-  RPORT=${RPORT:-9000}
-  LPORT=${LPORT:-4000}
-
-cat >$BHCONF <<EOF
-mode = "client"
-
-[client]
-remote = "$FOREIGN:$RPORT"
-bind   = "127.0.0.1:$LPORT"
-EOF
-
-cat >$SYS/backhaul.service <<EOF
-[Unit]
-After=network.target
-[Service]
-ExecStart=$BIN/backhaul -c $BHCONF
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-
-elif [[ "$ROLE" == "2" ]]; then
-  ### FOREIGN → SERVER
-  read -p "Backhaul listen port [9000]: " SPORT
-  SPORT=${SPORT:-9000}
-
-cat >$BHCONF <<EOF
-mode = "server"
-
-[server]
-bind = "0.0.0.0:$SPORT"
-EOF
-
-cat >$SYS/backhaul.service <<EOF
-[Unit]
-After=network.target
-[Service]
-ExecStart=$BIN/backhaul -c $BHCONF
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-
-else
-  echo "[ERROR] Invalid role"
-  exit 1
-fi
-
-### GOST MULTI-PORT
-mkdir -p $CONF
-read -p "Enter gost listen ports (comma separated): " PORTS
-IFS=',' read -ra PORT_LIST <<< "$PORTS"
-
-for P in "${PORT_LIST[@]}"; do
-  P=$(echo "$P" | xargs)
-  ss -lnt | grep -q ":$P " && echo "[ERROR] Port $P busy" && exit 1
-
-cat >$CONF/$P.json <<EOF
+  cat >$CONF/$P.json <<EOF
 {
   "Services":[{
     "Name":"gost-$P",
@@ -137,7 +61,7 @@ cat >$CONF/$P.json <<EOF
 }
 EOF
 
-cat >$SYS/gost@$P.service <<EOF
+  cat >$SYS/gost@$P.service <<EOF
 [Unit]
 After=network.target backhaul.service
 Requires=backhaul.service
@@ -148,47 +72,106 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-systemctl enable gost@$P
-done
+  systemctl daemon-reload
+  systemctl enable gost@$P
+  systemctl start gost@$P
+}
 
-### DPI / QUIC DAEMON
-mkdir -p $SWD $STATE
+remove_gost_port() {
+  read -p "Port to remove: " P
+  systemctl stop gost@$P 2>/dev/null || true
+  systemctl disable gost@$P 2>/dev/null || true
+  rm -f $SYS/gost@$P.service $CONF/$P.json
+  systemctl daemon-reload
+}
 
-cat >$SWD/gost-switchd.py <<'EOF'
-#!/usr/bin/env python3
-import os,time,subprocess
+list_ports() {
+  ls $CONF/*.json 2>/dev/null | sed 's#.*/##;s#.json##'
+}
 
-CONF="/etc/gost"
-PORTS=[f.replace(".json","") for f in os.listdir(CONF) if f.endswith(".json")]
+backhaul_config() {
+  echo "1) IRAN (client)"
+  echo "2) FOREIGN (server)"
+  read -p "Role: " R
 
-def rst(p):
-    o=subprocess.getoutput(f"timeout 3 nc -vz 127.0.0.1 {p}")
-    return "reset" in o or "refused" in o
+  mkdir -p /etc/backhaul
 
-while True:
-    for p in PORTS:
-        if rst(p):
-            subprocess.call(["systemctl","restart",f"gost@{p}"])
-    time.sleep(30)
+  if [[ $R == 1 ]]; then
+    read -p "Foreign IP: " F
+    read -p "Remote port [9000]: " RP
+    read -p "Local port [4000]: " LP
+    RP=${RP:-9000}; LP=${LP:-4000}
+cat >$BHCONF <<EOF
+mode="client"
+[client]
+remote="$F:$RP"
+bind="127.0.0.1:$LP"
 EOF
-chmod +x $SWD/gost-switchd.py
+  else
+    read -p "Listen port [9000]: " SP
+    SP=${SP:-9000}
+cat >$BHCONF <<EOF
+mode="server"
+[server]
+bind="0.0.0.0:$SP"
+EOF
+  fi
 
-cat >$SYS/gost-switchd.service <<EOF
+cat >$SYS/backhaul.service <<EOF
 [Unit]
 After=network.target
 [Service]
-ExecStart=/usr/bin/python3 $SWD/gost-switchd.py
+ExecStart=$BIN/backhaul -c $BHCONF
 Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
 
-### ENABLE SERVICES
-systemctl daemon-reload
-systemctl enable backhaul gost-switchd
-systemctl restart backhaul gost-switchd
-systemctl start gost@*
+  systemctl daemon-reload
+  systemctl restart backhaul
+}
 
-echo "=================================================="
-echo " Installation completed successfully"
-echo "=================================================="
+status_all() {
+  systemctl status backhaul --no-pager
+  systemctl status gost-switchd --no-pager
+  for p in $(list_ports); do
+    systemctl status gost@$p --no-pager
+  done
+}
+
+menu() {
+  clear
+  echo "========= Gost + Backhaul Manager ========="
+  echo "1) Install / Update gost"
+  echo "2) Install / Update Backhaul"
+  echo "3) Configure Backhaul (IRAN / FOREIGN)"
+  echo "4) Add new gost port"
+  echo "5) Remove gost port"
+  echo "6) List ports"
+  echo "7) Service status"
+  echo "8) Restart all"
+  echo "9) Remove ALL gost tunnels"
+  echo "0) Exit"
+  echo "=========================================="
+}
+
+mkdir -p $CONF
+
+while true; do
+  menu
+  read -p "Select: " C
+  case $C in
+    1) install_gost ;;
+    2) install_backhaul ;;
+    3) backhaul_config ;;
+    4) create_gost_port ;;
+    5) remove_gost_port ;;
+    6) list_ports ;;
+    7) status_all ;;
+    8) systemctl restart backhaul gost-switchd ;;
+    9)
+       for p in $(list_ports); do remove_gost_port; done ;;
+    0) exit ;;
+  esac
+  read -p "Press Enter..."
+done
